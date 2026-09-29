@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   Address,
   Keypair,
@@ -11,6 +11,8 @@ import {
 import {
   createSessionKeySigner,
   createPasskeyX402Signer,
+  SessionKeyExpiredError,
+  type SessionKeyExpiryWarning,
   type WebAuthnAssertion,
   type X402SignerActionEvent,
 } from "./x402-signer";
@@ -167,6 +169,8 @@ describe("createSessionKeySigner", () => {
     expect(events[0]!.outcome).toBe("error");
     expect(events[0]!.actor).toBe(C_ADDRESS);
     expect(events[0]!.error).toBeDefined();
+  });
+
   describe("capability scoping (#224)", () => {
     it("signs as before when no capabilities are configured (backward compatible)", async () => {
       const kp = Keypair.random();
@@ -239,6 +243,142 @@ describe("createSessionKeySigner", () => {
       ).toThrow(InvalidCapabilityRuleError);
     });
   });
+
+  describe("client-side expiration check (#425)", () => {
+    it("signs normally when expiration has not yet passed", async () => {
+      const kp = Keypair.random();
+      const expiry = new Date(10_000_000);
+      let simulatedTime = 5_000_000;
+
+      const signer = createSessionKeySigner({
+        address: C_ADDRESS,
+        secretKey: kp.secret(),
+        expiresAt: expiry,
+        now: () => simulatedTime,
+      });
+
+      const entry = makeV1AuthEntry(C_ADDRESS);
+      await expect(
+        signer.signAuthEntry(entry.toXDR("base64"), {
+          networkPassphrase: PASSPHRASE,
+          expirationLedger: 1000,
+        }),
+      ).resolves.toBeDefined();
+    });
+
+    it("refuses to sign with typed SessionKeyExpiredError naming expiry when expired", async () => {
+      const kp = Keypair.random();
+      const expiry = new Date("2026-07-01T12:00:00.000Z");
+      let simulatedTime = new Date("2026-07-01T12:00:01.000Z").getTime();
+      const events: X402SignerActionEvent[] = [];
+
+      const signer = createSessionKeySigner({
+        address: C_ADDRESS,
+        secretKey: kp.secret(),
+        expiresAt: expiry,
+        now: () => simulatedTime,
+        onSignerAction: (e) => {
+          events.push(e);
+        },
+      });
+
+      const entry = makeV1AuthEntry(C_ADDRESS);
+
+      let caught: SessionKeyExpiredError | undefined;
+      try {
+        await signer.signAuthEntry(entry.toXDR("base64"), {
+          networkPassphrase: PASSPHRASE,
+          expirationLedger: 1000,
+        });
+      } catch (e) {
+        caught = e as SessionKeyExpiredError;
+      }
+
+      expect(caught).toBeInstanceOf(SessionKeyExpiredError);
+      expect(caught?.expiresAt).toEqual(expiry);
+      expect(caught?.message).toMatch(/Agent session key expired at 2026-07-01T12:00:00.000Z/);
+      expect(caught?.message).toMatch(/Signing refused; nothing was spent/);
+      expect(caught?.retryable).toBe(false);
+
+      // Deny audit hook fired
+      expect(events).toHaveLength(1);
+      expect(events[0]?.action).toBe("deny");
+      expect(events[0]?.outcome).toBe("error");
+    });
+
+    it("accepts unix seconds for expiresAt and checks deterministically against clock seam", async () => {
+      const kp = Keypair.random();
+      const expirySeconds = 1_800_000_000; // in unix seconds
+      let simulatedTime = 1_800_000_001 * 1000; // 1s past expiry in ms
+
+      const signer = createSessionKeySigner({
+        address: C_ADDRESS,
+        secretKey: kp.secret(),
+        expiresAt: expirySeconds,
+        now: () => simulatedTime,
+      });
+
+      const entry = makeV1AuthEntry(C_ADDRESS);
+      await expect(
+        signer.signAuthEntry(entry.toXDR("base64"), {
+          networkPassphrase: PASSPHRASE,
+          expirationLedger: 1000,
+        }),
+      ).rejects.toBeInstanceOf(SessionKeyExpiredError);
+    });
+
+    it("triggers onExpiringSoon warning when remaining TTL is within warning threshold", async () => {
+      const kp = Keypair.random();
+      const expiry = new Date(1_000_000);
+      let simulatedTime = 950_000; // 50s before expiry
+      const onExpiringSoon = vi.fn();
+
+      const signer = createSessionKeySigner({
+        address: C_ADDRESS,
+        secretKey: kp.secret(),
+        expiresAt: expiry,
+        warnThresholdMs: 60_000, // warn if <= 60s
+        now: () => simulatedTime,
+        onExpiringSoon,
+      });
+
+      const entry = makeV1AuthEntry(C_ADDRESS);
+      await signer.signAuthEntry(entry.toXDR("base64"), {
+        networkPassphrase: PASSPHRASE,
+        expirationLedger: 1000,
+      });
+
+      expect(onExpiringSoon).toHaveBeenCalledTimes(1);
+      const warning: SessionKeyExpiryWarning = onExpiringSoon.mock.calls[0]![0];
+      expect(warning.remainingMs).toBe(50_000);
+      expect(warning.expiresAt).toEqual(expiry);
+      expect(warning.message).toMatch(/will expire in 50000ms/);
+    });
+
+    it("does not trigger warning when remaining time is above warning threshold", async () => {
+      const kp = Keypair.random();
+      const expiry = new Date(1_000_000);
+      let simulatedTime = 800_000; // 200s before expiry (threshold is 60s)
+      const onExpiringSoon = vi.fn();
+
+      const signer = createSessionKeySigner({
+        address: C_ADDRESS,
+        secretKey: kp.secret(),
+        expiresAt: expiry,
+        warnThresholdMs: 60_000,
+        now: () => simulatedTime,
+        onExpiringSoon,
+      });
+
+      const entry = makeV1AuthEntry(C_ADDRESS);
+      await signer.signAuthEntry(entry.toXDR("base64"), {
+        networkPassphrase: PASSPHRASE,
+        expirationLedger: 1000,
+      });
+
+      expect(onExpiringSoon).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("createPasskeyX402Signer", () => {
@@ -287,7 +427,6 @@ describe("createPasskeyX402Signer", () => {
   it("fires onSignerAction for both `authorize` (success) and `deny` (error)", async () => {
     const events: X402SignerActionEvent[] = [];
     const keyId = new Uint8Array(20).fill(9);
-  describe("capability scoping (#224)", () => {
     const assertion: WebAuthnAssertion = {
       authenticatorData: new Uint8Array(37).fill(1),
       clientDataJSON: new Uint8Array(50).fill(2),
@@ -326,7 +465,15 @@ describe("createPasskeyX402Signer", () => {
       "deny:error",
     ]);
     expect(events.every((e) => e.actor === C_ADDRESS)).toBe(true);
-      keyId: new Uint8Array(20).fill(9),
+  });
+
+  describe("capability scoping (#224)", () => {
+    const keyId = new Uint8Array(20).fill(9);
+    const assertion: WebAuthnAssertion = {
+      authenticatorData: new Uint8Array(37).fill(1),
+      clientDataJSON: new Uint8Array(50).fill(2),
+      signature: new Uint8Array(64).fill(3),
+      keyId,
     };
 
     it("refuses to sign an invocation outside the configured capabilities", async () => {

@@ -30,18 +30,51 @@ export interface AgentPolicyGrant {
   policies: string[];
 }
 
+export interface AgentSignerReader {
+  /**
+   * Read on-chain signer state for an agent key.
+   * Returns the token grants and attached policies, or null if key does not exist.
+   */
+  getSigner(
+    publicKey: string,
+    accountId?: string,
+  ): Promise<{ grants: AgentPolicyGrant[] } | null>;
+}
+
 export interface MintAgentInput {
   /** The agent's ed25519 public key (G…). Generate the keypair yourself
    * (e.g. `Keypair.random()`) — the SDK never sees or stores the secret. */
   publicKey: string;
   /** Token grants; at least one. */
   grants: AgentPolicyGrant[];
-  /** Optional on-chain expiration. A Date, or unix SECONDS (the contract's
-   * unit). Expired keys stop signing without a revoke. */
+  /**
+   * Optional on-chain expiration. A Date, or unix SECONDS (the contract's
+   * unit). Expired keys stop signing on-chain without an explicit revoke.
+   *
+   * Note on enforcement: The blockchain contract remains the sole authoritative
+   * enforcing layer. Client-side signers check expiration as a fail-fast ergonomic
+   * measure to refuse signing before transaction submission.
+   */
   expiresAt?: Date | number;
   /** Signer durability (default "persistent"). "temporary" entries are
    * cheaper but the wallet may shed them at the storage TTL. */
   store?: "persistent" | "temporary";
+  /**
+   * When true (default), reads back the wallet's on-chain signer state immediately
+   * after minting and verifies that the key exists with exactly the requested grants
+   * and policy co-signers (#424).
+   *
+   * WHY DEFAULT TO ON:
+   * Skipping verification saves an RPC round trip (~100-200ms), but leaves the caller
+   * blind to critical on-chain mismatches. If an admin transaction succeeds but policies
+   * were silently dropped or improperly recorded, the key may exist on-chain with
+   * UNINTENDED AUTHORITY (e.g. an unrestricted token grant) or be completely unusable.
+   * Because an over-permissioned agent session key poses direct risk of unauthorized
+   * fund movement, verification is opt-out, not opt-in.
+   */
+  verify?: boolean;
+  /** Optional reader passed directly for verification tests. */
+  signerReader?: AgentSignerReader;
 }
 
 export interface MintAgentResult {
@@ -65,6 +98,9 @@ export interface AgentKeyRuntime {
     store: "persistent" | "temporary";
   }): Promise<{ hash: string }>;
   removeAgentKey(publicKey: string): Promise<{ hash: string }>;
+  /** Optional reader for verification after minting. */
+  getSigner?(publicKey: string): Promise<{ grants: AgentPolicyGrant[] } | null>;
+  readSigner?(publicKey: string): Promise<{ grants: AgentPolicyGrant[] } | null>;
 }
 
 export interface AgentsFacade {
@@ -79,6 +115,8 @@ export interface AgentsFacadeDeps {
   /** Returns the connected wallet's session, or throws if not ready. */
   requireSession(): { accountId: string; keyId?: string };
   runtime?: AgentKeyRuntime;
+  /** Optional reader seam for on-chain signer verification. */
+  signerReader?: AgentSignerReader;
 }
 
 export class AgentsNotConfiguredError extends Error {
@@ -97,6 +135,48 @@ export class InvalidAgentInputError extends Error {
   }
 }
 
+export type VerificationMismatchDirection = "more_permissive" | "less_permissive" | "absent";
+
+/**
+ * Thrown when post-mint on-chain verification detects that the signer state
+ * on-chain does not match the requested grants (#424).
+ */
+export class AgentVerificationError extends Error {
+  readonly direction: VerificationMismatchDirection;
+  readonly differences: readonly string[];
+  readonly publicKey: string;
+  readonly txHash: string;
+
+  constructor(options: {
+    publicKey: string;
+    txHash: string;
+    direction: VerificationMismatchDirection;
+    differences: string[];
+  }) {
+    let header = "";
+    if (options.direction === "absent") {
+      header = `Agent key ${options.publicKey} was not found on-chain after minting (tx ${options.txHash}).`;
+    } else if (options.direction === "more_permissive") {
+      header =
+        `DANGEROUS: On-chain signer state is MORE PERMISSIVE than requested! ` +
+        `A key may now exist on-chain with unintended authority. ` +
+        `Immediate operator response required: revoke key ${options.publicKey} to prevent unauthorized transactions.`;
+    } else {
+      header =
+        `On-chain signer state is LESS PERMISSIVE than requested (key will be unable to transact as intended). ` +
+        `Operator response: check wallet configuration and retry minting.`;
+    }
+
+    const diffList = options.differences.map((d) => `  - ${d}`).join("\n");
+    super(`${header}\nDifferences detected:\n${diffList}`);
+    this.name = "AgentVerificationError";
+    this.direction = options.direction;
+    this.differences = options.differences;
+    this.publicKey = options.publicKey;
+    this.txHash = options.txHash;
+  }
+}
+
 const ED25519_PUBLIC_KEY = /^G[A-Z2-7]{55}$/;
 const CONTRACT_ID = /^C[A-Z2-7]{55}$/;
 
@@ -108,6 +188,79 @@ function toExpirationSeconds(expiresAt: Date | number | undefined): number | und
     throw new InvalidAgentInputError("expiresAt must be in the future");
   }
   return seconds;
+}
+
+export function verifyAgentSignerGrants(
+  requestedGrants: AgentPolicyGrant[],
+  onChainGrants: AgentPolicyGrant[],
+  context: { publicKey: string; txHash: string },
+): void {
+  const reqMap = new Map<string, Set<string>>();
+  for (const g of requestedGrants) {
+    reqMap.set(g.token, new Set(g.policies));
+  }
+
+  const actualMap = new Map<string, Set<string>>();
+  for (const g of onChainGrants) {
+    actualMap.set(g.token, new Set(g.policies));
+  }
+
+  const morePermissiveDiffs: string[] = [];
+  const lessPermissiveDiffs: string[] = [];
+
+  // 1. Check for extra token grants on-chain (more permissive: key can move unauthorized tokens)
+  for (const [token, policies] of actualMap.entries()) {
+    if (!reqMap.has(token)) {
+      morePermissiveDiffs.push(
+        `Extra token grant on-chain: ${token} (policies: [${Array.from(policies).join(", ")}])`,
+      );
+    }
+  }
+
+  // 2. Check each requested grant against on-chain
+  for (const [token, reqPolicies] of reqMap.entries()) {
+    const actualPolicies = actualMap.get(token);
+    if (!actualPolicies) {
+      lessPermissiveDiffs.push(`Missing token grant on-chain for ${token}`);
+      continue;
+    }
+
+    // Missing policies on-chain -> more permissive (co-signer policy was silently dropped!)
+    for (const p of reqPolicies) {
+      if (!actualPolicies.has(p)) {
+        morePermissiveDiffs.push(
+          `Grant for token ${token} is missing required policy co-signer on-chain: ${p}`,
+        );
+      }
+    }
+
+    // Extra policies on-chain -> less permissive (key must satisfy unexpected restrictions)
+    for (const p of actualPolicies) {
+      if (!reqPolicies.has(p)) {
+        lessPermissiveDiffs.push(
+          `Grant for token ${token} has unexpected extra policy co-signer on-chain: ${p}`,
+        );
+      }
+    }
+  }
+
+  if (morePermissiveDiffs.length > 0) {
+    throw new AgentVerificationError({
+      publicKey: context.publicKey,
+      txHash: context.txHash,
+      direction: "more_permissive",
+      differences: [...morePermissiveDiffs, ...lessPermissiveDiffs],
+    });
+  }
+
+  if (lessPermissiveDiffs.length > 0) {
+    throw new AgentVerificationError({
+      publicKey: context.publicKey,
+      txHash: context.txHash,
+      direction: "less_permissive",
+      differences: lessPermissiveDiffs,
+    });
+  }
 }
 
 export function createAgentsFacade(deps: AgentsFacadeDeps): AgentsFacade {
@@ -155,6 +308,31 @@ export function createAgentsFacade(deps: AgentsFacadeDeps): AgentsFacade {
         ...(expirationSeconds !== undefined ? { expirationSeconds } : {}),
         store: input.store ?? "persistent",
       });
+
+      // On-chain verification step (#424)
+      if (input.verify !== false) {
+        const reader =
+          input.signerReader ??
+          deps.signerReader ??
+          (runtime.getSigner ? { getSigner: (pk: string) => runtime.getSigner!(pk) } : undefined) ??
+          (runtime.readSigner ? { getSigner: (pk: string) => runtime.readSigner!(pk) } : undefined);
+
+        if (reader) {
+          const signerState = await reader.getSigner(input.publicKey, session.accountId);
+          if (!signerState) {
+            throw new AgentVerificationError({
+              publicKey: input.publicKey,
+              txHash: hash,
+              direction: "absent",
+              differences: [`Signer key ${input.publicKey} is absent from on-chain wallet state.`],
+            });
+          }
+          verifyAgentSignerGrants(input.grants, signerState.grants, {
+            publicKey: input.publicKey,
+            txHash: hash,
+          });
+        }
+      }
 
       return {
         hash,

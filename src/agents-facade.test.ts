@@ -1,15 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AgentsNotConfiguredError,
+  AgentVerificationError,
   InvalidAgentInputError,
   createAgentsFacade,
   type AgentKeyRuntime,
+  type AgentSignerReader,
 } from "./agents-facade";
 
 const AGENT_PK = "G".padEnd(56, "A");
 const TOKEN = "C".padEnd(56, "B");
 const SPENDING = "C".padEnd(56, "C");
 const VERIFIED = "C".padEnd(56, "D");
+const EXTRA_TOKEN = "C".padEnd(56, "E");
 
 function stubRuntime() {
   const addAgentKey = vi.fn<AgentKeyRuntime["addAgentKey"]>(async () => ({ hash: "addhash" }));
@@ -19,10 +22,11 @@ function stubRuntime() {
   return { runtime, addAgentKey, removeAgentKey, resume };
 }
 
-function build(runtime?: AgentKeyRuntime, keyId?: string) {
+function build(runtime?: AgentKeyRuntime, keyId?: string, signerReader?: AgentSignerReader) {
   return createAgentsFacade({
     requireSession: () => ({ accountId: "CWALLET", ...(keyId ? { keyId } : {}) }),
     runtime,
+    signerReader,
   });
 }
 
@@ -127,6 +131,161 @@ describe("wallet.agents.mint", () => {
         expiresAt: new Date(Date.now() - 1000),
       }),
     ).rejects.toBeInstanceOf(InvalidAgentInputError);
+  });
+});
+
+describe("wallet.agents.mint — on-chain read-back verification (#424)", () => {
+  it("succeeds when on-chain state is an exact match for requested grants and policies", async () => {
+    const { runtime } = stubRuntime();
+    const signerReader: AgentSignerReader = {
+      getSigner: vi.fn().mockResolvedValue({
+        grants: [{ token: TOKEN, policies: [SPENDING, VERIFIED] }],
+      }),
+    };
+    const agents = build(runtime, undefined, signerReader);
+
+    const result = await agents.mint({
+      publicKey: AGENT_PK,
+      grants: [{ token: TOKEN, policies: [SPENDING, VERIFIED] }],
+    });
+
+    expect(result.hash).toBe("addhash");
+    expect(signerReader.getSigner).toHaveBeenCalledWith(AGENT_PK, "CWALLET");
+  });
+
+  it("throws AgentVerificationError when minted key is absent entirely on-chain", async () => {
+    const { runtime } = stubRuntime();
+    const signerReader: AgentSignerReader = {
+      getSigner: vi.fn().mockResolvedValue(null),
+    };
+    const agents = build(runtime, undefined, signerReader);
+
+    let caught: AgentVerificationError | undefined;
+    try {
+      await agents.mint({
+        publicKey: AGENT_PK,
+        grants: [{ token: TOKEN, policies: [SPENDING] }],
+      });
+    } catch (e) {
+      caught = e as AgentVerificationError;
+    }
+
+    expect(caught).toBeInstanceOf(AgentVerificationError);
+    expect(caught?.direction).toBe("absent");
+    expect(caught?.publicKey).toBe(AGENT_PK);
+    expect(caught?.txHash).toBe("addhash");
+    expect(caught?.message).toMatch(/was not found on-chain/);
+  });
+
+  it("detects a missing policy as MORE PERMISSIVE (dangerous) and warns of unintended authority", async () => {
+    const { runtime } = stubRuntime();
+    // On-chain state is missing VERIFIED policy co-signer
+    const signerReader: AgentSignerReader = {
+      getSigner: vi.fn().mockResolvedValue({
+        grants: [{ token: TOKEN, policies: [SPENDING] }],
+      }),
+    };
+    const agents = build(runtime, undefined, signerReader);
+
+    let caught: AgentVerificationError | undefined;
+    try {
+      await agents.mint({
+        publicKey: AGENT_PK,
+        grants: [{ token: TOKEN, policies: [SPENDING, VERIFIED] }],
+      });
+    } catch (e) {
+      caught = e as AgentVerificationError;
+    }
+
+    expect(caught).toBeInstanceOf(AgentVerificationError);
+    expect(caught?.direction).toBe("more_permissive");
+    expect(caught?.message).toMatch(/MORE PERMISSIVE/);
+    expect(caught?.message).toMatch(/unintended authority/);
+    expect(caught?.differences).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(`missing required policy co-signer on-chain: ${VERIFIED}`),
+      ]),
+    );
+  });
+
+  it("detects an extra token grant as MORE PERMISSIVE (dangerous) and names the grant", async () => {
+    const { runtime } = stubRuntime();
+    // On-chain state has an extra unexpected token grant
+    const signerReader: AgentSignerReader = {
+      getSigner: vi.fn().mockResolvedValue({
+        grants: [
+          { token: TOKEN, policies: [SPENDING] },
+          { token: EXTRA_TOKEN, policies: [SPENDING] },
+        ],
+      }),
+    };
+    const agents = build(runtime, undefined, signerReader);
+
+    let caught: AgentVerificationError | undefined;
+    try {
+      await agents.mint({
+        publicKey: AGENT_PK,
+        grants: [{ token: TOKEN, policies: [SPENDING] }],
+      });
+    } catch (e) {
+      caught = e as AgentVerificationError;
+    }
+
+    expect(caught).toBeInstanceOf(AgentVerificationError);
+    expect(caught?.direction).toBe("more_permissive");
+    expect(caught?.message).toMatch(/MORE PERMISSIVE/);
+    expect(caught?.message).toMatch(/unintended authority/);
+    expect(caught?.differences).toEqual(
+      expect.arrayContaining([expect.stringContaining(`Extra token grant on-chain: ${EXTRA_TOKEN}`)]),
+    );
+  });
+
+  it("detects a missing token grant as LESS PERMISSIVE", async () => {
+    const { runtime } = stubRuntime();
+    // On-chain state has fewer token grants than requested
+    const signerReader: AgentSignerReader = {
+      getSigner: vi.fn().mockResolvedValue({
+        grants: [{ token: TOKEN, policies: [SPENDING] }],
+      }),
+    };
+    const agents = build(runtime, undefined, signerReader);
+
+    let caught: AgentVerificationError | undefined;
+    try {
+      await agents.mint({
+        publicKey: AGENT_PK,
+        grants: [
+          { token: TOKEN, policies: [SPENDING] },
+          { token: EXTRA_TOKEN, policies: [SPENDING] },
+        ],
+      });
+    } catch (e) {
+      caught = e as AgentVerificationError;
+    }
+
+    expect(caught).toBeInstanceOf(AgentVerificationError);
+    expect(caught?.direction).toBe("less_permissive");
+    expect(caught?.message).toMatch(/LESS PERMISSIVE/);
+    expect(caught?.differences).toEqual(
+      expect.arrayContaining([expect.stringContaining(`Missing token grant on-chain for ${EXTRA_TOKEN}`)]),
+    );
+  });
+
+  it("allows verification to be skipped via verify: false option", async () => {
+    const { runtime } = stubRuntime();
+    const signerReader: AgentSignerReader = {
+      getSigner: vi.fn().mockResolvedValue(null), // Would fail if checked
+    };
+    const agents = build(runtime, undefined, signerReader);
+
+    const result = await agents.mint({
+      publicKey: AGENT_PK,
+      grants: [{ token: TOKEN, policies: [SPENDING] }],
+      verify: false,
+    });
+
+    expect(result.hash).toBe("addhash");
+    expect(signerReader.getSigner).not.toHaveBeenCalled();
   });
 });
 

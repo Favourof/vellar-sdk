@@ -207,11 +207,80 @@ function comparePolicyAddresses(a: string, b: string): number {
 
 // ── agent (ed25519) signer ─────────────────────────────────────────────────────
 
+/** Injectable clock seam for time-based signer checks (defaults to () => Date.now()). */
+export type SignerClock = () => number;
+
+export interface SessionKeyExpiryWarning {
+  /** The configured expiration of the key. */
+  expiresAt: Date | number;
+  /** Milliseconds remaining until expiration. */
+  remainingMs: number;
+  /** Human-readable warning message. */
+  message: string;
+}
+
+/**
+ * Thrown when an agent key is used to sign after its configured expiration time (#425).
+ *
+ * This provides client-side fail-fast ergonomics so callers learn immediately that their
+ * key has expired, rather than failing opaquely on-chain at payment settlement time.
+ * Note: The blockchain remains the authoritative enforcing layer; this client check
+ * avoids wasted signatures and requests.
+ */
+export class SessionKeyExpiredError extends Error {
+  readonly expiresAt: Date;
+  readonly expiredAtMs: number;
+  readonly retryable: boolean = false;
+
+  constructor(expiresAt: Date | number, message?: string) {
+    const d =
+      expiresAt instanceof Date
+        ? expiresAt
+        : new Date(expiresAt > 1e11 ? expiresAt : expiresAt * 1000);
+    const msg =
+      message ??
+      `Agent session key expired at ${d.toISOString()}. Signing refused; nothing was spent.`;
+    super(msg);
+    this.name = "SessionKeyExpiredError";
+    this.expiresAt = d;
+    this.expiredAtMs = d.getTime();
+  }
+}
+
 export interface SessionKeySignerConfig {
   /** The smart-account C-address that pays. */
   address: string;
   /** The ed25519 session key secret (`S…`) attached to that wallet. */
   secretKey: string;
+  /**
+   * Optional on-chain expiration for this session key.
+   * A Date, unix seconds (<= 1e11), or unix milliseconds (> 1e11).
+   *
+   * CLIENT-SIDE FAIL-FAST ERGONOMICS:
+   * When configured, the signer refuses to sign expired authorizations client-side
+   * with a typed SessionKeyExpiredError before sending a transaction.
+   *
+   * IMPORTANT ARCHITECTURAL GUARANTEE:
+   * The Stellar blockchain remains the sole authoritatively enforcing layer
+   * for key expiration (via on-chain contract ledger/TTL validation). Client-side
+   * checking is an ergonomics and safety optimisation to prevent opaque contract
+   * failures and wasted network round trips; it does NOT replace on-chain enforcement.
+   */
+  expiresAt?: Date | number;
+  /**
+   * Warning threshold in milliseconds (or seconds if <= 100_000).
+   * When remaining time until expiresAt is less than or equal to this threshold,
+   * `onExpiringSoon` is invoked during sign attempts so hosts can notify operators
+   * or schedule passkey re-minting before payments fail.
+   */
+  warnThresholdMs?: number;
+  /** Callback fired when key is expiring soon (within warnThresholdMs). */
+  onExpiringSoon?: (warning: SessionKeyExpiryWarning) => void;
+  /**
+   * Injectable clock seam (defaults to () => Date.now()), following the pattern
+   * in src/circuit-breaker.ts, allowing tests to deterministically drive time.
+   */
+  now?: SignerClock;
   /**
    * Policy contracts this key's `SignerLimits` require, which must appear in the
    * signature map alongside the ed25519 entry.
@@ -228,6 +297,7 @@ export interface SessionKeySignerConfig {
    * to keep a tamper-evident record of who authorized or was denied which payment.
    */
   onSignerAction?: X402SignerActionHook;
+  /**
    * Client-side capability scoping (#224): restrict which resource
    * type (contract) + action (function name) combinations this signer will
    * sign, independent of the on-chain policy. Omit for no scoping (signs
@@ -266,12 +336,46 @@ export function createSessionKeySigner(config: SessionKeySignerConfig): SmartAcc
   const capabilities = config.capabilities ?? [];
   assertValidCapabilityRules(capabilities);
 
+  const now = config.now ?? (() => Date.now());
+  const expiryMs =
+    config.expiresAt !== undefined
+      ? config.expiresAt instanceof Date
+        ? config.expiresAt.getTime()
+        : config.expiresAt > 1e11
+          ? config.expiresAt
+          : config.expiresAt * 1000
+      : undefined;
+
+  const warnThresholdMs = config.warnThresholdMs;
+
   return {
     address: config.address,
     async signAuthEntry(entryXdr, { networkPassphrase, expirationLedger }) {
+      // 1. Client-side expiration check (#425) - fail fast before signing
+      if (expiryMs !== undefined) {
+        const currentTime = now();
+        if (currentTime >= expiryMs) {
+          const err = new SessionKeyExpiredError(config.expiresAt!);
+          await fire("deny", "error", networkPassphrase, err);
+          throw err;
+        }
+
+        if (warnThresholdMs !== undefined && expiryMs - currentTime <= warnThresholdMs) {
+          const remainingMs = Math.max(0, expiryMs - currentTime);
+          const warning: SessionKeyExpiryWarning = {
+            expiresAt: config.expiresAt!,
+            remainingMs,
+            message: `Agent session key will expire in ${remainingMs}ms (at ${new Date(expiryMs).toISOString()}). Re-minting requires user passkey interaction.`,
+          };
+          config.onExpiringSoon?.(warning);
+        }
+      }
+
       try {
         const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
         assertEntryAddress(entry, config.address);
+        const request = capabilityRequestFor(entry);
+        if (request) assertCapability(capabilities, request);
         const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
         const signature = keypair.sign(payload);
         setSignatureMap(entry, ed25519SignerKey(rawPk), ed25519Signature(signature), policies);
@@ -282,14 +386,6 @@ export function createSessionKeySigner(config: SessionKeySignerConfig): SmartAcc
         await fire("deny", "error", networkPassphrase, err);
         throw err;
       }
-      const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
-      assertEntryAddress(entry, config.address);
-      const request = capabilityRequestFor(entry);
-      if (request) assertCapability(capabilities, request);
-      const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
-      const signature = keypair.sign(payload);
-      setSignatureMap(entry, ed25519SignerKey(rawPk), ed25519Signature(signature), policies);
-      return entry.toXDR("base64");
     },
   };
 }
@@ -359,6 +455,8 @@ export function createPasskeyX402Signer(config: PasskeyX402SignerConfig): SmartA
       try {
         const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
         assertEntryAddress(entry, config.address);
+        const request = capabilityRequestFor(entry);
+        if (request) assertCapability(capabilities, request);
         const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
         const assertion = await config.webAuthn.sign(new Uint8Array(payload));
         setSignatureMap(
@@ -374,19 +472,6 @@ export function createPasskeyX402Signer(config: PasskeyX402SignerConfig): SmartA
         await fire("deny", "error", networkPassphrase, err);
         throw err;
       }
-      const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
-      assertEntryAddress(entry, config.address);
-      const request = capabilityRequestFor(entry);
-      if (request) assertCapability(capabilities, request);
-      const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
-      const assertion = await config.webAuthn.sign(new Uint8Array(payload));
-      setSignatureMap(
-        entry,
-        secp256r1SignerKey(assertion.keyId),
-        secp256r1Signature(assertion),
-        config.policies ?? [],
-      );
-      return entry.toXDR("base64");
     },
   };
 }
